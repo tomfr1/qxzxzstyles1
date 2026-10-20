@@ -1,0 +1,36 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.0
+
+      - name: Kernlogik-Test (ohne Minecraft)
+        run: |
+          mkdir -p /tmp/core-out
+          curl -sSL -o /tmp/gson.jar https://repo1.maven.org/maven2/com/google/code/gson/gson/2.10.1/gson-2.10.1.jar
+          javac -d /tmp/core-out -cp /tmp/gson.jar $(find src/main/java/dev/rpmixer/core -name '*.java')
+          java -cp /tmp/core-out:/tmp/gson.jar tools/CoreSmokeTest.java
+
+      - name: Build
+        run: gradle build --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: resourcepackmixer-jar
+          path: build/libs/*.jar
