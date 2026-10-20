@@ -1,0 +1,283 @@
+package dev.rpmixer.core;
+
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonElement;
+import com.google.gson.JsonObject;
+import com.google.gson.JsonParseException;
+import com.google.gson.JsonParser;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.StringReader;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.ArrayList;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.regex.Pattern;
+
+/**
+ * Erzeugt aus den Kategorie-Auswahlen ein Overlay-Resourcepack (Ordner) mit genau den benötigten Dateien.
+ *
+ * Konfliktregel: Wird dieselbe Zieldatei von zwei Targets aus unterschiedlichen Packs benötigt, gewinnt das
+ * Target, das in {@link Categories#ALL} zuerst kommt; der Konflikt wird als Warnung gemeldet.
+ */
+public final class OverlayBuilder {
+    private OverlayBuilder() {}
+
+    /** Wert für "ausdrücklich nicht überschreiben" bei Material-Einzelwahl (unterbricht die Vererbung). */
+    public static final String SKIP = "-";
+
+    /** Gemeinsame Vorlagen-Modelle, die NIE aus einem Quellpack übernommen werden (würden alle Items ändern). */
+    private static final Set<String> SHARED_PARENTS = Set.of(
+            "minecraft:item/generated", "minecraft:item/handheld", "minecraft:item/handheld_rod",
+            "minecraft:item/handheld_mace", "minecraft:item/spear_in_hand",
+            "minecraft:block/block", "minecraft:block/cube", "minecraft:block/cube_all",
+            "minecraft:block/cube_column", "minecraft:block/cube_bottom_top", "minecraft:block/orientable",
+            "minecraft:block/thin_block", "minecraft:block/cross");
+
+    private static final Pattern VALID_NS = Pattern.compile("[a-z0-9_.\\-]+");
+    private static final Pattern VALID_PATH = Pattern.compile("[a-z0-9_.\\-/]+");
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+    public static final class Result {
+        public final List<String> warnings = new ArrayList<>();
+        public final List<String> notes = new ArrayList<>();
+        public final Set<String> usedPacks = new TreeSet<>();
+        public int files;
+        public long bytes;
+
+        void warn(String m) {
+            if (!warnings.contains(m)) warnings.add(m);
+        }
+
+        void note(String m) {
+            if (notes.size() < 40 && !notes.contains(m)) notes.add(m);
+        }
+    }
+
+    public static Result build(Path out, Map<String, String> selections, Function<String, PackInfo> lookup,
+                               int packFormat) throws IOException {
+        Result r = new Result();
+        Files.createDirectories(out);
+        Map<String, String> written = new LinkedHashMap<>();
+        Map<String, PackFiles> open = new HashMap<>();
+        try {
+            for (CategoryDef cat : Categories.ALL) {
+                for (Target t : cat.targets) {
+                    String sel = selections.get(t.key);
+                    if (sel == null && t.parentKey != null) sel = selections.get(t.parentKey);
+                    if (sel == null || SKIP.equals(sel)) continue;
+                    PackInfo info = lookup.apply(sel);
+                    if (info == null) {
+                        r.warn("Pack nicht gefunden: " + sel + " (Kategorie " + cat.id + " wird nicht überschrieben)");
+                        continue;
+                    }
+                    if (!info.valid) {
+                        r.warn("Pack unbrauchbar: " + info.name + " – " + info.error);
+                        continue;
+                    }
+                    PackFiles pf = open.get(sel);
+                    if (pf == null) {
+                        try {
+                            pf = PackFiles.open(info.location);
+                        } catch (IOException e) {
+                            r.warn("Pack nicht lesbar: " + info.name + " – " + e.getMessage());
+                            continue;
+                        }
+                        open.put(sel, pf);
+                    }
+                    new Collector(out, t, info, pf, written, r).run();
+                }
+            }
+            if (r.files > 0) writeMeta(out, selections, written, packFormat);
+        } finally {
+            for (PackFiles p : open.values()) p.close();
+        }
+        return r;
+    }
+
+    private static void writeMeta(Path out, Map<String, String> selections, Map<String, String> written,
+                                  int packFormat) throws IOException {
+        JsonObject mc = new JsonObject();
+        JsonObject pack = new JsonObject();
+        pack.addProperty("description", "Generated by Resource Pack Mixer - do not edit");
+        pack.addProperty("min_format", packFormat);
+        pack.addProperty("max_format", packFormat);
+        mc.add("pack", pack);
+        Files.writeString(out.resolve("pack.mcmeta"), GSON.toJson(mc), StandardCharsets.UTF_8);
+
+        JsonObject manifest = new JsonObject();
+        manifest.add("selections", GSON.toJsonTree(selections));
+        manifest.add("files", GSON.toJsonTree(written));
+        Files.writeString(out.resolve("rpm-manifest.json"), GSON.toJson(manifest), StandardCharsets.UTF_8);
+    }
+
+    private static String[] split(String id) {
+        if (id == null) return null;
+        int i = id.indexOf(':');
+        String ns = i < 0 ? "minecraft" : id.substring(0, i);
+        String p = i < 0 ? id : id.substring(i + 1);
+        if (!VALID_NS.matcher(ns).matches() || !VALID_PATH.matcher(p).matches() || p.contains("..")) return null;
+        return new String[] {ns, p};
+    }
+
+    private static final class Collector {
+        final Path out;
+        final Target t;
+        final PackInfo info;
+        final PackFiles pf;
+        final Map<String, String> written;
+        final Result r;
+        final Deque<String> queue = new ArrayDeque<>();
+        final Set<String> seen = new HashSet<>();
+
+        Collector(Path out, Target t, PackInfo info, PackFiles pf, Map<String, String> written, Result r) {
+            this.out = out;
+            this.t = t;
+            this.info = info;
+            this.pf = pf;
+            this.written = written;
+            this.r = r;
+        }
+
+        void run() throws IOException {
+            for (String id : t.ids) {
+                String[] s = split(id);
+                if (s == null) continue;
+                for (String p : List.of("assets/" + s[0] + "/items/" + s[1] + ".json",
+                        "assets/" + s[0] + "/models/item/" + s[1] + ".json",
+                        "assets/" + s[0] + "/blockstates/" + s[1] + ".json")) {
+                    if (info.paths.contains(p)) queue.add(p);
+                }
+            }
+            for (String f : t.files) copyWithMeta(f);
+            for (String pre : t.prefixes) for (String p : info.withPrefix(pre)) copy(p);
+
+            int guard = 0;
+            while (!queue.isEmpty() && guard++ < 5000) {
+                String p = queue.poll();
+                if (!seen.add(p)) continue;
+                copy(p);
+                JsonElement el = readJson(p);
+                if (el == null) continue;
+                String[] parts = p.split("/");
+                String ns = parts.length > 1 ? parts[1] : "minecraft";
+                if (p.contains("/models/")) handleModel(el, ns);
+                else handleDefinition(el);
+            }
+        }
+
+        void handleDefinition(JsonElement el) {
+            collectModelRefs(el, this::enqueueModel);
+        }
+
+        void handleModel(JsonElement el, String ns) {
+            if (!el.isJsonObject()) return;
+            JsonObject o = el.getAsJsonObject();
+            if (o.has("parent") && o.get("parent").isJsonPrimitive()) enqueueModel(o.get("parent").getAsString());
+            if (o.has("textures") && o.get("textures").isJsonObject()) {
+                for (Map.Entry<String, JsonElement> e : o.getAsJsonObject("textures").entrySet()) {
+                    JsonElement v = e.getValue();
+                    if (!v.isJsonPrimitive()) continue;
+                    String ref = v.getAsString();
+                    if (ref.startsWith("#")) continue;
+                    String[] s = split(ref);
+                    if (s == null) continue;
+                    String path = "assets/" + s[0] + "/textures/" + s[1] + ".png";
+                    if (!copyWithMeta(path)) r.note("Textur fehlt im Pack " + info.name + ": " + ref + " (Fallback)");
+                }
+            }
+            if (o.has("overrides")) collectModelRefs(o.get("overrides"), this::enqueueModel);
+        }
+
+        void enqueueModel(String ref) {
+            String[] s = split(ref);
+            if (s == null) return;
+            String key = s[0] + ":" + s[1];
+            if (SHARED_PARENTS.contains(key) || s[1].startsWith("builtin/")) return;
+            String path = "assets/" + s[0] + "/models/" + s[1] + ".json";
+            if (info.paths.contains(path)) queue.add(path);
+            else r.note("Modell nicht im Pack " + info.name + ": " + key + " (Fallback)");
+        }
+
+        boolean copyWithMeta(String path) {
+            boolean ok = copy(path);
+            if (ok) copy(path + ".mcmeta");
+            return ok;
+        }
+
+        boolean copy(String rel) {
+            if (!info.paths.contains(rel)) return false;
+            String prev = written.get(rel);
+            if (prev != null) {
+                if (!prev.equals(info.id)) {
+                    r.warn("Konflikt: " + rel + " wird von mehreren Packs benötigt; behalten: "
+                            + prev + ", ignoriert: " + info.id);
+                }
+                return true;
+            }
+            try {
+                Path dest = out.resolve(rel).normalize();
+                if (!dest.startsWith(out.normalize())) {
+                    r.warn("Unsicherer Zielpfad abgelehnt: " + PackPaths.safeForLog(rel));
+                    return false;
+                }
+                Files.createDirectories(dest.getParent());
+                try (InputStream in = pf.open(rel)) {
+                    long n = Files.copy(in, dest, StandardCopyOption.REPLACE_EXISTING);
+                    r.bytes += n;
+                }
+                if (r.bytes > Limits.MAX_OVERLAY_BYTES) throw new IOException("Overlay über dem Größenlimit");
+                written.put(rel, info.id);
+                r.usedPacks.add(info.id);
+                r.files++;
+                return true;
+            } catch (IOException e) {
+                r.warn("Kopieren fehlgeschlagen (" + PackPaths.safeForLog(rel) + "): " + e.getMessage());
+                return false;
+            }
+        }
+
+        JsonElement readJson(String p) {
+            try (InputStream in = pf.open(p)) {
+                String s = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+                if (!s.isEmpty() && s.charAt(0) == '\uFEFF') s = s.substring(1);
+                return JsonParser.parseReader(new StringReader(s));
+            } catch (IOException | JsonParseException | IllegalStateException e) {
+                r.warn("Ungültiges JSON übersprungen: " + PackPaths.safeForLog(p));
+                return null;
+            }
+        }
+    }
+
+    static void collectModelRefs(JsonElement e, Consumer<String> sink) {
+        if (e == null) return;
+        if (e.isJsonObject()) {
+            for (Map.Entry<String, JsonElement> en : e.getAsJsonObject().entrySet()) {
+                String k = en.getKey();
+                JsonElement v = en.getValue();
+                if ((k.equals("model") || k.equals("base")) && v.isJsonPrimitive()
+                        && v.getAsJsonPrimitive().isString()) {
+                    sink.accept(v.getAsString());
+                } else {
+                    collectModelRefs(v, sink);
+                }
+            }
+        } else if (e.isJsonArray()) {
+            for (JsonElement x : e.getAsJsonArray()) collectModelRefs(x, sink);
+        }
+    }
+}

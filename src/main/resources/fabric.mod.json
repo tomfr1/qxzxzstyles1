@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "resourcepackmixer",
+  "version": "${version}",
+  "name": "Resource Pack Mixer",
+  "description": "Client-only: combine texture categories from different local resource packs via a generated overlay pack.",
+  "license": "All-Rights-Reserved",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["dev.rpmixer.client.RpmClient"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.1",
+    "minecraft": "1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
